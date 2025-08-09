@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hockey Puck — Game Shell (v0.2.1 • full puck rule)</title>
+<style>
+  :root{--bg:#0b1e2d;--ink:#e6f2ff;--muted:#9fb9cf;--panel:rgba(0,0,0,.45)}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  #stage{display:block;width:100vw;height:100vh;cursor:none}
+  #topbar{position:fixed;left:12px;top:12px;display:flex;gap:8px;align-items:center;z-index:20}
+  .btn{background:var(--panel);border:1px solid rgba(255,255,255,.15);border-radius:10px;padding:8px 12px;color:var(--ink);cursor:pointer}
+  .pill{background:var(--panel);border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:6px 10px;font-size:12px}
+  #hud{position:fixed;right:10px;top:10px;background:var(--panel);padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.4;z-index:20}
+  #overlay{position:fixed;inset:0;display:grid;place-items:center;background:linear-gradient(180deg,rgba(0,0,0,.55),rgba(0,0,0,.65));z-index:30}
+  #startBtn{font-size:18px;padding:12px 18px;border-radius:12px;background:#19b36b;color:#042015;border:none;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+  #goalBanner{position:fixed;inset:0;display:none;align-items:center;justify-content:center;pointer-events:none;z-index:25}
+  #goalBanner .text{font-size:64px;font-weight:800;letter-spacing:2px;color:#fff;text-shadow:0 4px 24px rgba(0,0,0,.6)}
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <button id="pauseBtn" class="btn">⏸︎ Pause</button>
+    <span class="pill">Level <span id="levelNo">0</span> / 20</span>
+    <span class="pill">Seed: <span id="seedText"></span></span>
+  </div>
+
+  <div id="hud">
+    <div>Level Time: <span id="levelTime">0.00</span>s</div>
+    <div>Total Time: <span id="totalTime">0.00</span>s</div>
+    <div>Speed: <span id="spd">0.00</span> px/s • Spin: <span id="spinDbg">0.00</span> rad/s</div>
+    <div id="penHUD">Penalties: 0</div>
+  </div>
+
+  <div id="overlay"><button id="startBtn">Start</button></div>
+  <div id="goalBanner"><div class="text">GOAL!</div></div>
+  <canvas id="stage"></canvas>
+
+<script>
+(() => {
+  const can = document.getElementById('stage');
+  const g = can.getContext('2d');
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const resize = ()=>{ can.width = Math.floor(innerWidth*dpr); can.height = Math.floor(innerHeight*dpr); g.setTransform(dpr,0,0,dpr,0,0); };
+  addEventListener('resize', resize); resize();
+
+  function xmur3(str){let h=1779033703^str.length;for(let i=0;i<str.length;i++){h=Math.imul(h^str.charCodeAt(i),3432918353);h=h<<13|h>>>19;}return function(){h=Math.imul(h^h>>>16,2246822507);h=Math.imul(h^h>>>13,3266489909);return (h^h>>>16)>>>0;}}
+  function sfc32(a,b,c,d){return function(){a|=0;b|=0;c|=0;d|=0;var t=(a+b|0)+d|0;d=d+1|0;a=b^(b>>>9);b=c+(c<<3)|0;c=(c<<21|c>>>11);c=c+t|0;return (t>>>0)/4294967296;}}
+  function rngFromSeed(seedStr){const seed = xmur3(seedStr); return sfc32(seed(),seed(),seed(),seed());}
+
+  // Use FULL PUCK rule
+  const GOAL_RULE = "full";
+
+  const P = { mu:0.012, microDrag:0.996, wallE:0.70, hitE:0.30, stickFric:0.60, spinKeep:0.94, stickR:22, puckR:14, botE:0.35, botFric:0.50, m:0.17, g:9.81 };
+
+  let penalties = 0;
+  let penaltyTimer = 0;
+
+  const MASTER_SEED = 'HOCKEY-SEASON-1';
+  let levelIdx = 0;
+  const MAX_LEVEL = 20;
+  document.getElementById('seedText').textContent = MASTER_SEED;
+
+  const rink = { w:1200, h:600, shape:'rect' };
+  const goal = { x: 1200-14, y: 600/2-50, w:14, h:100 };
+
+  function ySpanAtX(shapeType, x, W, H){
+    const cx=W/2, cy=H/2, dx=x-cx;
+    if (shapeType==='rect') return [0,H];
+    if (shapeType==='ellipse'){
+      const a=W/2, b=H/2, t=1 - (dx*dx)/(a*a);
+      if (t<=0) return [cy, cy];
+      const yh=b*Math.sqrt(t); return [cy-yh, cy+yh];
+    }
+    const a=W/2, b=H/2, t=1 - Math.abs(dx)/a;
+    const yh = Math.max(0, b*t); return [cy-yh, cy+yh];
+  }
+  function clampGoalToShape(){
+    const [yMin,yMax]=ySpanAtX(rink.shape, goal.x, rink.w, rink.h);
+    const maxH = Math.max(0, yMax - yMin);
+    if (goal.h > maxH) goal.h = maxH;
+    goal.y = Math.min(Math.max(goal.y, yMin), Math.max(yMin, yMax - goal.h));
+  }
+  function projectInside(x,y){
+    const cx=rink.w/2, cy=rink.h/2, dx=x-cx, dy=y-cy;
+    if (rink.shape==='rect'){
+      const px = Math.max(-rink.w/2+P.puckR, Math.min(dx, rink.w/2-P.puckR));
+      const py = Math.max(-rink.h/2+P.puckR, Math.min(dy, rink.h/2-P.puckR));
+      return {x:cx+px, y:cy+py, nx: (px!==dx?Math.sign(dx):0), ny: (py!==dy?Math.sign(dy):0)};
+    }
+    if (rink.shape==='ellipse'){
+      const a=rink.w/2-P.puckR, b=rink.h/2-P.puckR;
+      const val=(dx*dx)/(a*a)+(dy*dy)/(b*b);
+      if (val<=1) return {x,y,nx:0,ny:0};
+      const s = 1/Math.sqrt(val);
+      return {x: cx+dx*s, y: cy+dy*s, nx:dx/(a*a), ny:dy/(b*b)};
+    }
+    const a=rink.w/2-P.puckR, b=rink.h/2-P.puckR;
+    const val=Math.abs(dx)/a + Math.abs(dy)/b;
+    if (val<=1) return {x,y,nx:0,ny:0};
+    const f = 1/val;
+    return {x: cx+dx*f, y: cy+dy*f, nx: Math.sign(dx)/a, ny: Math.sign(dy)/b};
+  }
+
+  const mouse = { x:0,y:0,vx:0,vy:0,_px:0,_py:0,_t:performance.now()/1000 };
+  addEventListener('mousemove', e=>{
+    const r = can.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    const now = performance.now()/1000, dt = Math.max(1e-3, now - mouse._t);
+    mouse.vx = (x - mouse._px)/dt; mouse.vy = (y - mouse._py)/dt;
+    mouse._px = x; mouse._py = y; mouse._t = now; mouse.x = x; mouse.y = y;
+  });
+
+  const puck = { x: rink.w*0.25, y: rink.h*0.5, vx:0, vy:0, ang:0, w:0 };
+  const inertia = ()=> 0.5 * P.m * P.puckR * P.puckR;
+
+  let bots = [];
+  const confetti = [];
+  let prevX = null;
+
+  let running=false, paused=false;
+  let totalTime=0, levelTime=0;
+  let lastTS = performance.now();
+  document.getElementById('pauseBtn').onclick = () => {
+    paused = !paused;
+    document.getElementById('pauseBtn').textContent = paused ? '▶︎ Resume' : '⏸︎ Pause';
+  };
+  document.getElementById('startBtn').onclick = ()=>{ document.getElementById('overlay').style.display='none'; running=true; };
+
+  const len=(x,y)=>Math.hypot(x,y);
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const randRange=(rng,a,b)=> a + rng()*(b-a);
+
+  function generateLevel(i){
+    const rng = rngFromSeed(MASTER_SEED+':'+i);
+    const rp = rng(); rink.shape = (rp<0.5)?'rect':(rp<0.8?'ellipse':'diamond');
+    rink.w = 1000 + Math.floor(rng()*400);
+    rink.h = 520 + Math.floor(rng()*200);
+
+    goal.w = 14; goal.x = rink.w - goal.w;
+    const [yMin,yMax] = ySpanAtX(rink.shape, goal.x, rink.w, rink.h);
+    const avail = Math.max(60, yMax - yMin - 40);
+    goal.h = clamp(70 + Math.floor(rng()*120), 60, avail);
+    const gyMin = yMin + 20, gyMax = yMax - 20 - goal.h;
+    goal.y = clamp(gyMin + rng()*(gyMax-gyMin), gyMin, gyMax);
+    clampGoalToShape();
+
+    const base = Math.floor(i/3), extra = (rng()<0.5?0:1), count = clamp(base+extra,0,8);
+    bots = [];
+    for(let k=0;k<count;k++){
+      bots.push({ x: rink.w*0.60 + rng()*(rink.w*0.40-60), y: 40 + rng()*(rink.h-80), vx:0, vy:0, r: 18 + rng()*8, m:80+(rng()*25-10), target:null });
+    }
+
+    puck.x=rink.w*0.25; puck.y=rink.h*0.5; puck.vx=puck.vy=puck.w=0; puck.ang=0;
+    levelTime=0; penaltyTimer=0; prevX = puck.x;
+    P.mu = clamp(0.014 - i*0.0003, 0.007, 0.02);
+    document.getElementById('levelNo').textContent = i;
+
+    const [tMin,tMax]=ySpanAtX(rink.shape, goal.x, rink.w, rink.h);
+    console.assert(goal.y >= tMin-1 && (goal.y+goal.h) <= tMax+1, 'Goal aperture not inside shape span.');
+  }
+
+  function newBotTarget(rng,b){ b.target = { x: randRange(rng, rink.w*0.60, rink.w-60), y: randRange(rng, 40, rink.h-40) }; }
+  function stepBot(dt, rng, b){
+    const maxSpeed = 240 + rng()*40, maxAccel = 580 + rng()*60;
+    if (!b.target || Math.hypot(b.target.x-b.x, b.target.y-b.y) < 30) newBotTarget(rng,b);
+    const dx=b.target.x-b.x, dy=b.target.y-b.y, d=Math.hypot(dx,dy)||1;
+    const dvx=(dx/d)*maxSpeed - b.vx, dvy=(dy/d)*maxSpeed - b.vy;
+    const aMag=Math.hypot(dvx,dvy)||1, limit=maxAccel;
+    const ax=dvx * Math.min(1, limit/aMag), ay=dvy * Math.min(1, limit/aMag);
+    b.vx += ax*dt; b.vy += ay*dt; b.x += b.vx*dt; b.y += b.vy*dt;
+    const minX = rink.w*0.55 + b.r; if (b.x < minX){ b.x=minX; b.vx=Math.abs(b.vx); }
+    if (b.x > rink.w - b.r){ b.x=rink.w-b.r; b.vx=-Math.abs(b.vx); }
+    if (b.y < b.r){ b.y=b.r; b.vy=Math.abs(b.vy); }
+    if (b.y > rink.h - b.r){ b.y=rink.h-b.r; b.vy=-Math.abs(b.vy); }
+  }
+
+  function collideStick(puck, sx, sy, svx, svy, sr){
+    const dx = puck.x - sx, dy = puck.y - sy, dist = Math.hypot(dx,dy), minD = P.puckR + sr; if (dist>=minD) return;
+    const nx=(dist>1e-6)?dx/dist:1, ny=(dist>1e-6)?dy/dist:0, tx=-ny, ty=nx;
+    const rvx=puck.vx - svx, rvy=puck.vy - svy, vN=rvx*nx + rvy*ny, vT=rvx*tx + rvy*ty; if (vN>=0) return;
+    const dVn = -(1+P.hitE)*vN; puck.vx += dVn*nx; puck.vy += dVn*ny;
+    const dVt = Math.max(-Math.abs(dVn)*P.stickFric, Math.min(Math.abs(dVn)*P.stickFric, -vT));
+    puck.vx += dVt*tx; puck.vy += dVt*ty;
+    puck.w += (P.puckR * (P.m*dVt)) / inertia();
+    puck.x = sx + nx*minD; puck.y = sy + ny*minD;
+  }
+
+  function collidePuckBot(puck, b){
+    const dx = b.x - puck.x, dy = b.y - puck.y, dist=Math.hypot(dx,dy), minD=P.puckR + b.r; if (dist<=0||dist>=minD) return;
+    const nx=dx/dist, ny=dy/dist, tx=-ny, ty=nx;
+    const rvx=b.vx - puck.vx, rvy=b.vy - puck.vy; const vN=rvx*nx + rvy*ny, vT=rvx*tx + rvy*ty;
+    if (vN>0){ const corr=(minD-dist)+0.01; puck.x-=nx*corr*0.5; puck.y-=ny*corr*0.5; b.x+=nx*corr*0.5; b.y+=ny*corr*0.5; return; }
+    const invMass = 1/P.m + 1/b.m;
+    const jn = -(1+P.botE)*vN / invMass; const jnx=jn*nx, jny=jn*ny;
+    puck.vx -= jnx/P.m; puck.vy -= jny/P.m; b.vx += jnx/b.m; b.vy += jny/b.m;
+    const jtIdeal = -vT / invMass; const jtCap = P.botFric * Math.abs(jn); const jt = Math.max(-jtCap, Math.min(jtCap, jtIdeal));
+    const jtx=jt*tx, jty=jt*ty;
+    puck.vx -= jtx/P.m; puck.vy -= jty/P.m; b.vx += jtx/b.m; b.vy += jty/b.m;
+    const I=inertia(); const jtMag=Math.hypot(jtx,jty); const spinSign=(vT!==0)?Math.sign(-vT):1; puck.w += (P.puckR * jtMag * spinSign)/I;
+    const corr=(minD-dist)+0.01; puck.x-=nx*corr*0.5; puck.y-=ny*corr*0.5; b.x+=nx*corr*0.5; b.y+=ny*corr*0.5;
+  }
+
+  function spawnConfetti(x,y){
+    for(let i=0;i<80;i++){ const a=Math.random()*Math.PI*2, sp=150+Math.random()*250; confetti.push({x,y,vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, life:0.9+Math.random()*0.6}); }
+    const banner = document.getElementById('goalBanner'); banner.style.display='flex'; setTimeout(()=>{ banner.style.display='none'; }, 800);
+  }
+
+  function step(dt){
+    if (!paused && penaltyTimer<=0){ totalTime += dt; levelTime += dt; }
+    const cx=can.width/dpr*0.5, cy=can.height/dpr*0.5; const ox=cx - rink.w/2, oy=cy - rink.h/2;
+    const sx=(penaltyTimer>0? rink.w*0.25 : mouse.x-ox), sy=(penaltyTimer>0? rink.h*0.5 : mouse.y-oy);
+
+    const s=len(puck.vx,puck.vy); if (s>0){ const dv=P.mu*P.g*dt; const ns=Math.max(0,s-dv); const k=(s>0)?ns/s:0; puck.vx*=k; puck.vy*=k; }
+    const md=Math.pow(P.microDrag, dt*60); puck.vx*=md; puck.vy*=md; puck.w*=Math.pow(P.spinKeep, dt*60); puck.ang += puck.w*dt;
+
+    if (penaltyTimer<=0) collideStick(puck, sx, sy, mouse.vx, mouse.vy, P.stickR);
+
+    if (prevX === null) prevX = puck.x;
+    puck.x += puck.vx*dt; puck.y += puck.vy*dt;
+
+    const proj = projectInside(puck.x, puck.y);
+    if (proj.x !== puck.x || proj.y !== puck.y){
+      const nx = proj.nx, ny = proj.ny; const nlen = Math.hypot(nx,ny) || 1; const ux = nx/nlen, uy = ny/nlen;
+      const vn = puck.vx*ux + puck.vy*uy; if (vn>0) { puck.vx -= (1+P.wallE)*vn*ux; puck.vy -= (1+P.wallE)*vn*uy; }
+      puck.x = proj.x; puck.y = proj.y;
+    }
+
+    const r=P.puckR;
+    if (puck.x < r){ puck.x=r; puck.vx=Math.abs(puck.vx)*P.wallE; }
+    const inAperture = (puck.y >= goal.y) && (puck.y <= goal.y + goal.h);
+    if (puck.x > rink.w - r){
+      if (!inAperture){
+        puck.x = rink.w - r; puck.vx = -Math.abs(puck.vx)*P.wallE;
+      }
+    }
+    if (puck.y < r){ puck.y=r; puck.vy=Math.abs(puck.vy)*P.wallE; }
+    if (puck.y > rink.h - r){ puck.y=rink.h - r; puck.vy=-Math.abs(puck.vy)*P.wallE; }
+
+    const rng = rngFromSeed(MASTER_SEED+':'+levelIdx+':wander');
+    for (const b of bots){ stepBot(dt, rng, b); for(let i=0;i<2;i++) collidePuckBot(puck,b); }
+
+    if (penaltyTimer<=0){
+      const stickX = sx, stickY = sy;
+      for (const b of bots){
+        const dx = stickX - b.x, dy = stickY - b.y;
+        if (Math.hypot(dx,dy) < (P.stickR + b.r)){
+          penalties++; penaltyTimer = 5.0;
+          puck.x = rink.w*0.25; puck.y = rink.h*0.5; puck.vx=puck.vy=puck.w=0; puck.ang=0;
+          break;
+        }
+      }
+    } else {
+      penaltyTimer -= dt; if (penaltyTimer<0) penaltyTimer=0;
+    }
+
+    const lineX = goal.x;
+    const yOK = (puck.y >= goal.y) && (puck.y <= goal.y + goal.h);
+    let crossed = false;
+    if (GOAL_RULE === "any"){
+      const leadPrev = prevX + r, leadNow = puck.x + r;
+      crossed = (leadPrev < lineX) && (leadNow >= lineX);
+    } else {
+      const trailPrev = prevX - r, trailNow = puck.x - r;
+      crossed = (trailPrev < lineX) && (trailNow >= lineX);
+    }
+    if (yOK && crossed){ spawnConfetti(lineX + goal.w*0.5, puck.y); nextLevel(); }
+    prevX = puck.x;
+
+    for (let i=confetti.length-1;i>=0;i--){ const p=confetti[i]; p.life -= dt; p.vy += 400*dt; p.x += p.vx*dt; p.y += p.vy*dt; if (p.life<=0) confetti.splice(i,1); }
+
+    document.getElementById('spd').textContent = len(puck.vx,puck.vy).toFixed(2);
+    document.getElementById('spinDbg').textContent = puck.w.toFixed(2);
+    document.getElementById('levelTime').textContent = levelTime.toFixed(2);
+    document.getElementById('totalTime').textContent = totalTime.toFixed(2);
+    document.getElementById('penHUD').textContent = 'Penalties: '+penalties + (penaltyTimer>0?`  (Penalty: ${penaltyTimer.toFixed(1)}s)`:'' );
+  }
+
+  function draw(){
+    g.clearRect(0,0,can.width,can.height);
+    const cx=can.width/dpr*0.5, cy=can.height/dpr*0.5; const ox=cx - rink.w/2, oy=cy - rink.h/2;
+
+    g.save(); g.translate(ox,oy);
+    g.fillStyle="#cfe9ff"; g.strokeStyle="#1b3b5a"; g.lineWidth=2;
+    if (rink.shape==='rect'){ g.fillRect(0,0,rink.w,rink.h); g.strokeRect(0,0,rink.w,rink.h); }
+    else if (rink.shape==='ellipse'){ g.beginPath(); g.ellipse(rink.w/2, rink.h/2, rink.w/2, rink.h/2, 0, 0, Math.PI*2); g.fill(); g.stroke(); }
+    else { const cx2=rink.w/2, cy2=rink.h/2; g.beginPath(); g.moveTo(cx2, cy2 - rink.h/2); g.lineTo(cx2 + rink.w/2, cy2); g.lineTo(cx2, cy2 + rink.h/2); g.lineTo(cx2 - rink.w/2, cy2); g.closePath(); g.fill(); g.stroke(); }
+
+    g.strokeStyle="#b11"; g.beginPath(); g.moveTo(rink.w/2,0); g.lineTo(rink.w/2,rink.h); g.stroke();
+
+    g.fillStyle="rgba(255,0,0,.12)"; g.fillRect(goal.x,goal.y,goal.w,goal.h);
+    g.strokeStyle="#e33"; g.strokeRect(goal.x,goal.y,goal.w,goal.h);
+
+    g.save(); g.translate(puck.x,puck.y); g.fillStyle="#2b2b2b"; g.beginPath(); g.arc(0,0,P.puckR,0,Math.PI*2); g.fill(); g.rotate(puck.ang); g.strokeStyle="rgba(255,255,255,.6)"; g.beginPath(); g.moveTo(0,0); g.lineTo(P.puckR,0); g.stroke(); g.restore();
+
+    for (const b of bots){ g.save(); g.translate(b.x,b.y); g.fillStyle="#0b4"; g.beginPath(); g.arc(0,0,b.r,0,Math.PI*2); g.fill(); g.strokeStyle="rgba(0,0,0,.35)"; g.stroke(); g.restore(); }
+
+    for (const p of confetti){ g.fillStyle = `hsla(${(p.x+p.y)%360},90%,60%,${Math.max(0,p.life)})`; g.fillRect(p.x, p.y, 4, 4); }
+
+    g.restore();
+
+    g.save();
+    let showStickX = mouse.x, showStickY = mouse.y;
+    if (penaltyTimer>0){ const cx3=can.width/dpr*0.5, cy3=can.height/dpr*0.5; const ox3=cx3 - rink.w/2, oy3=cy3 - rink.h/2; showStickX = ox3 + rink.w*0.25; showStickY = oy3 + rink.h*0.5; }
+    g.translate(showStickX,showStickY); g.fillStyle="rgba(0,255,128,.20)"; g.strokeStyle="#0e0"; g.lineWidth=2; g.beginPath(); g.arc(0,0,P.stickR,0,Math.PI*2); g.fill(); g.stroke(); g.fillStyle="rgba(255,255,255,.85)"; g.beginPath(); g.arc(0,0,2,0,Math.PI*2); g.fill(); g.restore();
+  }
+
+  function nextLevel(){
+    if (levelIdx < MAX_LEVEL){ levelIdx++; generateLevel(levelIdx); }
+    else { running=false; alert('Season complete! Total time: '+totalTime.toFixed(2)+'s'); }
+  }
+
+  generateLevel(0);
+  document.getElementById('levelNo').textContent = levelIdx;
+
+  requestAnimationFrame(function loop(ts){
+    const dt = Math.min(0.033, (ts-lastTS)/1000); lastTS = ts;
+    if (running && !paused) step(dt);
+    draw();
+    requestAnimationFrame(loop);
+  });
+})();
+</script>
+</body>
+</html>
