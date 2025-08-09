@@ -219,10 +219,13 @@
     if (prevX === null) prevX = puck.x;
     puck.x += puck.vx*dt; puck.y += puck.vy*dt;
 
-    const proj = projectInside(puck.x, puck.y);
-    if (proj.x !== puck.x || proj.y !== puck.y){
-      const nx = proj.nx, ny = proj.ny; const nlen = Math.hypot(nx,ny) || 1; const ux = nx/nlen, uy = ny/nlen;
-      const vn = puck.vx*ux + puck.vy*uy; if (vn>0) { puck.vx -= (1+P.wallE)*vn*ux; puck.vy -= (1+P.wallE)*vn*uy; }
+    const inGoal = (puck.x > goal.x) && (puck.y >= goal.y) && (puck.y <= goal.y + goal.h);
+    if (!inGoal){
+      const proj = projectInside(puck.x, puck.y);
+      if (proj.x !== puck.x || proj.y !== puck.y){
+        const nx = proj.nx, ny = proj.ny; const nlen = Math.hypot(nx,ny) || 1; const ux = nx/nlen, uy = ny/nlen;
+        const vn = puck.vx*ux + puck.vy*uy; if (vn>0) { puck.vx -= (1+P.wallE)*vn*ux; puck.vy -= (1+P.wallE)*vn*uy; }
+      }
       puck.x = proj.x; puck.y = proj.y;
     }
 
