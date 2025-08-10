@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Puckshot — v0.3.1</title>
+<title>Puckshot — v0.3.3</title>
 <style>
   :root{--bg:#0b1e2d;--ink:#e6f2ff;--panel:rgba(0,0,0,.45)}
   html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -54,13 +54,14 @@
   function rngFromSeed(seedStr){const seed = xmur3(seedStr); return sfc32(seed(),seed(),seed(),seed());}
 
   // ===== Config =====
-  const GOAL_RULE = "full"; // full puck across
-  const TUNING = { hitBoost: 1.00, maxSpeed: 900 };
+  const GOAL_RULE = "full"; // full puck across the plane
+  const TUNING = { hitBoost: 1.00, maxSpeed: 900 }; // easy tuning
   const P = { mu:0.012, microDrag:0.996, wallE:0.70, hitE:0.30, stickFric:0.60, spinKeep:0.94, stickR:22, puckR:14, botE:0.35, botFric:0.50, m:0.17, g:9.81 };
 
-  const PENALTY_FREEZE = 2.0; // seconds of control lockout
-  const PENALTY_CLOCK  = 5.0; // seconds added to total time immediately
+  const PENALTY_FREEZE = 2.0; // seconds of input freeze
+  const PENALTY_CLOCK  = 5.0; // seconds added to total time
 
+  // ===== State =====
   let penalties = 0;
   let penaltyTimer = 0;
 
@@ -69,7 +70,7 @@
   const MAX_LEVEL = 20;
   document.getElementById('seedText').textContent = MASTER_SEED;
 
-  // ===== Organic rink “tube” (top(x), bottom(x)) =====
+  // ===== Organic rink (tube): y ∈ [top(x), bottom(x)] =====
   const rink = { w:1200, h:600 };
   const shape = { W:1200, H:600, top:(x)=>80, bot:(x)=>520 };
 
@@ -82,18 +83,17 @@
       return sum/(norm||1);
     };
   }
-
   function ySpanAtX(x){ x=Math.max(0,Math.min(shape.W,x)); return [shape.top(x), shape.bot(x)]; }
 
-  function projectInsidePuck(p){
-    if (p.x < P.puckR){ p.x=P.puckR; p.vx=Math.abs(p.vx)*P.wallE; }
-    if (p.x > shape.W - P.puckR){ p.x=shape.W-P.puckR; p.vx=-Math.abs(p.vx)*P.wallE; }
-    const [t,b]=ySpanAtX(p.x), top=t+P.puckR, bot=b-P.puckR;
+  // Top/bottom only — horizontal walls handled separately (to keep the goal mouth open)
+  function keepInsideVertical(p){
+    const [t,b]=ySpanAtX(Math.max(0,Math.min(shape.W,p.x)));
+    const top=t+P.puckR, bot=b-P.puckR;
     if (p.y < top){ p.y=top; p.vy=Math.abs(p.vy)*P.wallE; }
     if (p.y > bot){ p.y=bot; p.vy=-Math.abs(p.vy)*P.wallE; }
   }
 
-  // Goal (always at right)
+  // Goal (right side)
   const goal = { x: 1200-14, y: 250, w:14, h:100 };
 
   // Entities
@@ -127,8 +127,9 @@
   const len=(x,y)=>Math.hypot(x,y);
   const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
   const randRange=(rng,a,b)=> a + rng()*(b-a);
-
   function clampSpeed(p){ const s=Math.hypot(p.vx,p.vy); if (s>TUNING.maxSpeed){ const k=TUNING.maxSpeed/s; p.vx*=k; p.vy*=k; } }
+
+  // Hotkeys for tuning
   addEventListener('keydown',(e)=>{
     if (e.key===']'){ TUNING.hitBoost=+(TUNING.hitBoost+0.05).toFixed(2); console.log('hitBoost',TUNING.hitBoost); }
     if (e.key==='['){ TUNING.hitBoost=Math.max(0.1,+(TUNING.hitBoost-0.05).toFixed(2)); console.log('hitBoost',TUNING.hitBoost); }
@@ -163,7 +164,7 @@
       return Math.max(shape.top(x) + minChannel, Math.min(rink.h, base));
     };
 
-    // Goal at right, clamped to legal span; ensure ≥ 110% puck diameter
+    // Goal at right; ≥110% puck dia; clamp to legal span
     goal.w = 14; goal.x = shape.W - goal.w;
     const [yMin, yMax] = ySpanAtX(goal.x);
     const avail = Math.max(60, yMax - yMin - 40);
@@ -244,11 +245,13 @@
   }
   function showPenaltyBanner(){ const el=document.getElementById('penaltyBanner'); el.style.display='flex'; setTimeout(()=>{ el.style.display='none'; }, 1200); }
 
+  // ===== Main step =====
   function step(dt){
     if (!paused && penaltyTimer<=0){ totalTime += dt; levelTime += dt; }
 
     const cx=can.width/dpr*0.5, cy=can.height/dpr*0.5; const ox=cx - shape.W/2, oy=cy - shape.H/2;
-    const sx=(penaltyTimer>0? shape.W*0.25 : mouse.x-ox), sy=(penaltyTimer>0? (shape.top(shape.W*0.25)+shape.bot(shape.W*0.25))/2 : mouse.y-oy);
+    const sx=(penaltyTimer>0? shape.W*0.25 : mouse.x-ox);
+    const sy=(penaltyTimer>0? (shape.top(shape.W*0.25)+shape.bot(shape.W*0.25))/2 : mouse.y-oy);
 
     // Glide + spin damp
     const s=len(puck.vx,puck.vy); if (s>0){ const dv=P.mu*P.g*dt; const ns=Math.max(0,s-dv); const k=(s>0)?ns/s:0; puck.vx*=k; puck.vy*=k; }
@@ -262,26 +265,42 @@
     // Integrate
     puck.x += puck.vx*dt; puck.y += puck.vy*dt;
 
-    // --- Robust goal crossing (swept trailing/leading edge) BEFORE wall bounces ---
-    const r=P.puckR, lineX = goal.x;
-    const prevEdgeX = (GOAL_RULE === "full") ? (prevX - r) : (prevX + r);
-    const currEdgeX = (GOAL_RULE === "full") ? (puck.x - r) : (puck.x + r);
-    if (prevEdgeX < lineX && currEdgeX >= lineX){
+    // ===== Robust goal detection (before any horizontal wall bounce) =====
+    const r = P.puckR;
+    const frontX = goal.x;
+    const backX  = goal.x + goal.w - r; // center past this => leading edge past back plane
+    const prevEdgeX = (GOAL_RULE==="full") ? (prevX - r) : (prevX + r);
+    const currEdgeX = (GOAL_RULE==="full") ? (puck.x - r) : (puck.x + r);
+
+    let scored = false;
+
+    // 1) Trailing-edge crossing of front plane (full puck)
+    if (prevEdgeX < frontX && currEdgeX >= frontX){
       const dx = (currEdgeX - prevEdgeX) || 1e-9;
-      const t = (lineX - prevEdgeX) / dx;
+      const t = (frontX - prevEdgeX) / dx;
       const crossY = prevY + t * (puck.y - prevY);
-      if (crossY >= goal.y && crossY <= goal.y + goal.h){
-        spawnConfetti(lineX + goal.w*0.5, puck.y);
-        nextLevel();
-      }
+      if (crossY >= goal.y && crossY <= goal.y + goal.h) scored = true;
     }
-    // update prev center for next frame
+
+    // 2) Backup: center crosses back plane while within the mouth
+    if (!scored){
+      const centerPastBack = (puck.x >= backX);
+      const centerYOK = (puck.y >= goal.y) && (puck.y <= goal.y + goal.h);
+      if (centerPastBack && centerYOK) scored = true;
+    }
+
+    if (scored){ spawnConfetti(frontX + goal.w*0.5, puck.y); nextLevel(); }
+
+    // Update prev center for next frame
     prevX = puck.x; prevY = puck.y;
 
-    // Keep inside tube + reflect top/bottom
-    projectInsidePuck(puck);
+    // Vertical (top/bottom) tube collisions
+    keepInsideVertical(puck);
 
-    // Right wall with goal cut-out (after scoring check)
+    // ===== Horizontal walls (after scoring) =====
+    // Left wall
+    if (puck.x < P.puckR){ puck.x=P.puckR; puck.vx=Math.abs(puck.vx)*P.wallE; }
+    // Right wall with goal mouth cut-out
     const inAperture = (puck.y >= goal.y) && (puck.y <= goal.y + goal.h);
     if (puck.x > shape.W - r && !inAperture){ puck.x = shape.W - r; puck.vx = -Math.abs(puck.vx)*P.wallE; }
 
@@ -316,19 +335,20 @@
     document.getElementById('penHUD').textContent = 'Penalties: '+penalties + (penaltyTimer>0?`  (Penalty: ${penaltyTimer.toFixed(1)}s)`:'' );
   }
 
+  // ===== Draw =====
   function draw(){
     g.clearRect(0,0,can.width,can.height);
     const cx=can.width/dpr*0.5, cy=can.height/dpr*0.5; const ox=cx - shape.W/2, oy=cy - shape.H/2;
 
     g.save(); g.translate(ox,oy);
-    // Rink tube polygon
+    // Rink polygon
     g.fillStyle="#cfe9ff"; g.strokeStyle="#1b3b5a"; g.lineWidth=2;
     const S=64; g.beginPath();
     for (let i=0;i<=S;i++){ const x=(i/S)*shape.W, y=shape.top(x); if(i===0) g.moveTo(x,y); else g.lineTo(x,y); }
     for (let i=S;i>=0;i--){ const x=(i/S)*shape.W, y=shape.bot(x); g.lineTo(x,y); }
     g.closePath(); g.fill(); g.stroke();
 
-    // Center line (visual)
+    // Center line
     g.strokeStyle="#b11"; g.beginPath(); g.moveTo(shape.W/2, shape.top(shape.W/2)); g.lineTo(shape.W/2, shape.bot(shape.W/2)); g.stroke();
 
     // Goal
@@ -338,7 +358,7 @@
     // Puck
     g.save(); g.translate(puck.x,puck.y); g.fillStyle="#2b2b2b"; g.beginPath(); g.arc(0,0,P.puckR,0,Math.PI*2); g.fill(); g.rotate(puck.ang); g.strokeStyle="rgba(255,255,255,.6)"; g.beginPath(); g.moveTo(0,0); g.lineTo(P.puckR,0); g.stroke(); g.restore();
 
-    // Defenders
+    // Bots
     for (const b of bots){ g.save(); g.translate(b.x,b.y); g.fillStyle="#0b4"; g.beginPath(); g.arc(0,0,b.r,0,Math.PI*2); g.fill(); g.strokeStyle="rgba(0,0,0,.35)"; g.stroke(); g.restore(); }
 
     // Confetti
@@ -346,7 +366,7 @@
 
     g.restore();
 
-    // Stick (screen space, freeze during penalty at start)
+    // Stick (screen space; frozen during penalty at start)
     g.save();
     let showStickX = mouse.x, showStickY = mouse.y;
     if (penaltyTimer>0){
@@ -356,6 +376,7 @@
     g.translate(showStickX,showStickY); g.fillStyle="rgba(0,255,128,.20)"; g.strokeStyle="#0e0"; g.lineWidth=2; g.beginPath(); g.arc(0,0,P.stickR,0,Math.PI*2); g.fill(); g.stroke(); g.fillStyle="rgba(255,255,255,.85)"; g.beginPath(); g.arc(0,0,2,0,Math.PI*2); g.fill(); g.restore();
   }
 
+  // ===== Flow =====
   function nextLevel(){
     if (levelIdx < MAX_LEVEL){ levelIdx++; generateLevel(levelIdx); }
     else { running=false; alert('Season complete! Total time: '+totalTime.toFixed(2)+'s'); }
